@@ -29,6 +29,10 @@ services:
       # 短创建超时：模拟端 8 秒后才回包，稳定复现“创建成功但回包超时”
       KUBE_CREATE_TIMEOUT: "3"
       KUBE_VERIFY_TIMEOUT: "10"
+      # Job 索引初始 LIST 最长等待（秒）；之后由 WATCH 增量维护
+      JOB_INDEX_INITIAL_WAIT: "5"
+      # 单次 WATCH 的服务端超时（秒），到时正常重连并重新 LIST
+      KUBE_WATCH_TIMEOUT: "300"
       CATCHUP_DB: "/data/catchup.db"
       # 故障注入头（测试演练用；置空则关闭）
       KUBE_MOCK_FAULT: "create-timeout"

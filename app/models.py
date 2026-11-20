@@ -12,6 +12,25 @@ class JobMatchSource(str, Enum):
     catchup = "catchup"       # 本服务补建的 Job
 
 
+class IndexState(str, Enum):
+    initializing = "initializing"  # 首次 LIST 未完成，索引不可用
+    ready = "ready"                # WATCH 已建立，索引实时
+    stale = "stale"                # 有上一次完整清单，但 WATCH 断开/410
+
+
+class IndexStatus(BaseModel):
+    namespace: str
+    state: IndexState
+    ready: bool = Field(..., description="索引实时可用")
+    stale: bool = Field(..., description="有完整清单但已过期（断线/410 期间）")
+    has_snapshot: bool = Field(..., description="是否至少完成过一次 LIST")
+    job_count: int
+    resource_version: str | None = None
+    synced_at: datetime | None = Field(None, description="最近一次完整 LIST 同步时间")
+    stale_since: datetime | None = Field(None, description="本轮索引变为过期的时间")
+    last_error: str | None = None
+
+
 class ScheduleResponse(BaseModel):
     namespace: str
     cronjob: str
@@ -26,6 +45,11 @@ class ScheduleResponse(BaseModel):
     )
     existing_job_source: JobMatchSource | None = None
     within_catchup_window: bool = Field(..., description="距到点是否在 2 小时补跑期限内（UTC）")
+    index_state: IndexState = Field(..., description="Job 索引状态")
+    index_stale: bool = Field(
+        ..., description="索引是否过期：此时 existing_job=null 不能当作“无 Job”"
+    )
+    index_status: IndexStatus = Field(..., description="命名空间 Job 索引明细")
 
 
 class CatchupStatus(str, Enum):
@@ -45,6 +69,12 @@ class CatchupResponse(BaseModel):
     job_source: JobMatchSource | None = None
     reason: str | None = Field(None, description="拒绝或待核实原因")
     record_id: int | None = Field(None, description="本地补跑台账记录 ID")
+    index_state: IndexState | None = Field(
+        None, description="本次判定时 Job 索引状态"
+    )
+    index_stale: bool | None = Field(
+        None, description="索引过期：pending_verification 不代表“无 Job”"
+    )
 
 
 class RecordResponse(BaseModel):
@@ -65,3 +95,6 @@ class RecordResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     kubernetes_api: str
+    job_indexes: list[IndexStatus] = Field(
+        default_factory=list, description="各命名空间 Job 索引状态（按命名空间复用）"
+    )

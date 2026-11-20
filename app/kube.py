@@ -8,10 +8,11 @@
 """
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, AsyncIterator
 
 import httpx
 
@@ -39,6 +40,10 @@ class KubeNotFound(KubeError):
     """资源不存在（HTTP 404）。"""
 
 
+class KubeGone(KubeError):
+    """WATCH 的 resourceVersion 已过期（HTTP 410），调用方需重新 LIST 重建索引。"""
+
+
 @dataclass
 class KubeConfig:
     base_url: str
@@ -47,6 +52,8 @@ class KubeConfig:
     timeout: float = 10.0
     create_timeout: float = 5.0
     verify_timeout: float = 10.0
+    list_timeout: float = 10.0
+    watch_timeout: float = 300.0
     extra_headers: dict[str, str] | None = None
 
     @classmethod
@@ -62,6 +69,8 @@ class KubeConfig:
             timeout=float(os.environ.get("KUBE_TIMEOUT", "10")),
             create_timeout=float(os.environ.get("KUBE_CREATE_TIMEOUT", "5")),
             verify_timeout=float(os.environ.get("KUBE_VERIFY_TIMEOUT", "10")),
+            list_timeout=float(os.environ.get("KUBE_LIST_TIMEOUT", "10")),
+            watch_timeout=float(os.environ.get("KUBE_WATCH_TIMEOUT", "300")),
             extra_headers=extra,
         )
 
@@ -94,11 +103,77 @@ class KubeClient:
             f"/apis/batch/v1/namespaces/{namespace}/cronjobs/{name}",
         )
 
-    async def list_jobs(self, namespace: str) -> list[dict[str, Any]]:
-        data = await self._request(
-            "GET", f"/apis/batch/v1/namespaces/{namespace}/jobs"
+    async def list_jobs_page(self, namespace: str) -> dict[str, Any]:
+        """返回完整 JobList（含 metadata.resourceVersion），供索引建立 LIST 使用。"""
+        return await self._request(
+            "GET",
+            f"/apis/batch/v1/namespaces/{namespace}/jobs",
+            timeout=self.config.list_timeout,
         )
+
+    async def list_jobs(self, namespace: str) -> list[dict[str, Any]]:
+        data = await self.list_jobs_page(namespace)
         return data.get("items", [])
+
+    async def watch_jobs(
+        self,
+        namespace: str,
+        resource_version: str,
+        *,
+        on_open: Any = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """WATCH 命名空间下的 Job，逐行产出事件。
+
+        - 连接建立时回调 on_open()，调用方据此把索引标记为实时；
+        - resourceVersion 过期（410）抛 KubeGone，调用方需重新 LIST；
+        - 服务端正常结束（watch 超时）则生成器正常结束，调用方重连即可。
+        """
+        path = f"/apis/batch/v1/namespaces/{namespace}/jobs"
+        params = {
+            "watch": "1",
+            "resourceVersion": resource_version,
+            "allowWatchBookmarks": "true",
+            "timeoutSeconds": str(max(1, int(self.config.watch_timeout))),
+        }
+        read_timeout = httpx.Timeout(
+            self.config.watch_timeout + 30.0,
+            connect=self.config.timeout,
+        )
+        try:
+            async with self._client.stream(
+                "GET", path, params=params, timeout=read_timeout
+            ) as resp:
+                if resp.status_code == 410:
+                    body = (await resp.aread()).decode("utf-8", "replace")
+                    raise KubeGone(
+                        f"WATCH {namespace} resourceVersion={resource_version} "
+                        f"已过期: {body[:300]}"
+                    )
+                if resp.status_code == 404:
+                    raise KubeNotFound(f"{path} 不存在")
+                if resp.status_code >= 400:
+                    body = (await resp.aread()).decode("utf-8", "replace")
+                    raise KubeError(
+                        f"WATCH {namespace} 失败: HTTP {resp.status_code} {body[:300]}"
+                    )
+                if on_open is not None:
+                    on_open()
+                async for line in resp.aiter_lines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        yield json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        raise KubeError(
+                            f"WATCH {namespace} 返回非 JSON 行: {line[:200]}"
+                        ) from exc
+        except httpx.TimeoutException as exc:
+            raise KubeError(
+                f"Kubernetes API WATCH 超时: GET {path}: {exc}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise KubeError(f"Kubernetes API WATCH 失败: GET {path}: {exc}") from exc
 
     async def create_job(self, namespace: str, job_manifest: dict[str, Any]) -> dict[str, Any]:
         # 创建单独使用更短的超时，以便触发“回包超时先回查”
@@ -116,16 +191,27 @@ class KubeClient:
             timeout=self.config.verify_timeout,
         )
 
+    async def mock_control(
+        self, action: str, method: str = "POST", params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """调用模拟 K8s 的故障控制面（仅演练环境使用，如断开 WATCH/制造 410）。"""
+        return await self._request(method, f"/_mock/{action}", params=params)
+
     async def _request(
         self,
         method: str,
         path: str,
         json: dict[str, Any] | None = None,
         timeout: float | None = None,
+        params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         try:
             resp = await self._client.request(
-                method, path, json=json, timeout=timeout or self.config.timeout
+                method,
+                path,
+                json=json,
+                params=params,
+                timeout=timeout or self.config.timeout,
             )
         except httpx.TimeoutException as exc:
             raise KubeError(f"Kubernetes API 请求超时: {method} {path}: {exc}") from exc
