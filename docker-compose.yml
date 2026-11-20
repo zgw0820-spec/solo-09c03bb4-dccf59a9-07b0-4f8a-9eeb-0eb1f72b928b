@@ -1,0 +1,42 @@
+services:
+  # 本地 Kubernetes 1.32 batch/v1 API 模拟
+  mock-k8s:
+    build: .
+    image: cronjob-catchup:latest
+    command: uvicorn mock_k8s.server:app --host 0.0.0.0 --port 8001
+    environment:
+      # 创建类故障注入的服务端滞留时长（秒），需大于客户端 KUBE_CREATE_TIMEOUT
+      MOCK_SLOW_DELAY: "8"
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8001/healthz')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # 巡检补跑 FastAPI 服务
+  catchup-api:
+    build: .
+    image: cronjob-catchup:latest
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8080
+    depends_on:
+      mock-k8s:
+        condition: service_healthy
+    environment:
+      KUBE_API_URL: "http://mock-k8s:8001"
+      KUBE_TIMEOUT: "10"
+      # 短创建超时：模拟端 8 秒后才回包，稳定复现“创建成功但回包超时”
+      KUBE_CREATE_TIMEOUT: "3"
+      KUBE_VERIFY_TIMEOUT: "10"
+      CATCHUP_DB: "/data/catchup.db"
+      # 故障注入头（测试演练用；置空则关闭）
+      KUBE_MOCK_FAULT: "create-timeout"
+      TZ: "UTC"
+    volumes:
+      - catchup-data:/data
+    ports:
+      - "8080:8080"
+
+volumes:
+  catchup-data:
